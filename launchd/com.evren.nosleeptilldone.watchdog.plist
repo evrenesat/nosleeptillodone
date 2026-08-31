@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.evren.nosleeptilldone.watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/sbin/no-sleep-till-done-watchdog</string>
+    <string>--interval-seconds</string>
+    <string>5</string>
+    <string>--grace-seconds</string>
+    <string>20</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/no-sleep-till-done-watchdog.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/var/log/no-sleep-till-done-watchdog.log</string>
+</dict>
+</plist>

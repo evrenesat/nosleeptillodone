@@ -1,0 +1,20 @@
+[package]
+name = "no-sleep-till-done"
+version = "0.1.0"
+edition = "2021"
+description = "Keep a Mac awake until configured work is done"
+license = "Apache-2.0"
+repository = "https://github.com/evrenesat/nosleeptillodone"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+toml_edit = "0.20"
+tray-icon = "0.22"
+winit = "0.30"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

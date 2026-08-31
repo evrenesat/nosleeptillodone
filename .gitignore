@@ -1,0 +1,12 @@
+/target/
+
+# Local/editor noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp

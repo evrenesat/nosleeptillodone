@@ -1,0 +1,32 @@
+# no-sleep-till-done configuration
+
+# Keep the background service's sleep override active while the menu app runs.
+enabled = true
+
+# Seconds the lid must remain closed before the controller sleeps the Mac.
+delay_seconds = 60
+
+# Seconds between lid-state checks in the controller.
+poll_seconds = 1
+
+# Seconds between menu bar refreshes.
+menu_refresh_seconds = 5
+
+[process_wait]
+# When enabled, sleep is delayed after delay_seconds until all matching
+# command lines disappear, then exit_grace_seconds is counted before sleep.
+enabled = false
+command_substrings = [
+  "codex",
+  "python /path/to/agent-daemon.py",
+]
+exit_grace_seconds = 300
+
+[colors]
+# Color for the small menu bar state dot.
+# Supports #rrggbb hex colors and standard HTML/CSS color names.
+ready = "green"
+timer = "orange"
+process_wait = "blue"
+error = "red"
+unknown = "gray"
