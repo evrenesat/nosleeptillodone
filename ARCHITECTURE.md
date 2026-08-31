@@ -17,7 +17,7 @@ No Sleep Till Done has three processes: a root-run controller, a root-run safety
 | Config | `~/.config/no-sleep-till-done/config.toml`, created with defaults and opened via `/usr/bin/open -t`; reload generations in the lease tell the controller to apply validated changes without restarting. |
 | Enable state | The persisted top-level `enabled` value and lease state allow the menu app to restore or activate the sleep override without quitting or using administrator approval. |
 | Service health | The menu checks both launchd jobs and compares installed binaries/plists with bundled resources. Maintenance actions appear only for missing, unhealthy, or outdated services. |
-| Start at login | The menu bar app writes/removes `~/Library/LaunchAgents/com.evren.nosleeptilldone.menubar.plist` using its current app executable path and manages it with user-scoped `launchctl`, so no sudo is required. |
+| Start at login | The menu bar app writes/removes `~/Library/LaunchAgents/com.evren.nosleeptilldone.menubar.plist` using its current app executable path and enables/disables it with user-scoped `launchctl`. The toggle does not spawn or stop the current app process. |
 | Shutdown | Runs `pmset -b disablesleep 0` when the app heartbeat disappears, expires, or `/tmp/com.evren.nosleeptilldone.reset` appears; menu Quit removes the heartbeat and writes the reset request. |
 | Rename migration | On first renamed launch, the menu app copies the legacy config if needed, replaces the legacy user LaunchAgent, and refreshes both heartbeat paths so protection remains active. The conditional background-service action replaces legacy root services after administrator approval. |
 

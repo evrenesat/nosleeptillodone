@@ -135,10 +135,6 @@ fn enable_start_at_login() -> io::Result<()> {
     fs::write(&path, launch_agent_plist(&executable))?;
 
     let target = launchctl_target();
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootstrap", &target])
-        .arg(&path)
-        .status();
     let service = format!("{target}/{LAUNCH_AGENT_LABEL}");
     let _ = Command::new("/bin/launchctl")
         .args(["enable", &service])

@@ -66,7 +66,7 @@ open "$HOME/Applications/No Sleep Till Done.app"
 
 `No Sleep Till Done Enabled` controls the sleep override without quitting the menu app. The setting persists in the config file and does not require Touch ID or a password. `Reload Configuration` validates the file and tells the resident background service to apply controller settings without restarting it.
 
-The menu includes `Start at Login: On/Off`. That toggle writes or removes the current user's LaunchAgent and does not require Touch ID or a password.
+The menu includes `Start at Login: On/Off`. That toggle writes or removes the current user's LaunchAgent and does not require Touch ID or a password. It changes future login behavior without relaunching or stopping the currently running menu app.
 
 The menu checks the background service and safety watchdog. On the first install, choose `Install Background Service...` and approve the one administrator prompt. The maintenance item is hidden while both services are healthy. It reappears as `Repair Background Service...` or `Update Background Service...` only when action is required. Normal starts, quits, enable changes, configuration reloads, and start-at-login changes do not ask for a password.
 
