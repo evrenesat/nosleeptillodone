@@ -12,7 +12,7 @@ No Sleep Till Done has three processes: a root-run controller, a root-run safety
 | Display behavior | Runs `pmset displaysleepnow` on the lid-close edge. |
 | Wake display | Runs `caffeinate -u -t 2` on the lid-open edge. |
 | Delayed sleep | If the lid remains closed past the configured delay, temporarily disables `SleepDisabled` and runs `pmset sleepnow`. |
-| Process wait | Optional `[process_wait]` config matches case-sensitive full-command substrings from `/bin/ps`; after matches exit, a grace timer runs before lid-closed sleep. |
+| Process wait | Optional `[process_wait]` config matches case-sensitive full-command substrings from `/bin/ps`; after matches exit, a grace timer runs before lid-closed sleep. The menu app uses a one-second PID/PPID snapshot while waiting is relevant and shows direct matches plus available parent context in a read-only tree. |
 | Battery display | The menu bar app reads `pmset -g batt` and renders charge digits, a vertical tick bar, and state marker as one compact icon without separate title spacing. |
 | Config | `~/.config/no-sleep-till-done/config.toml`, created with defaults and opened via `/usr/bin/open -t`; reload generations in the lease tell the controller to apply validated changes without restarting. |
 | Enable state | The persisted top-level `enabled` value and lease state allow the menu app to restore or activate the sleep override without quitting or using administrator approval. |
@@ -40,6 +40,8 @@ lid open
 The daemon manages only the battery lid-close sleep override. It is meant for moving a MacBook briefly while background work continues, not for long-term closed-lid operation in confined spaces. Process-aware waiting applies only after lid-close delay expiry; lid-open idle sleep remains governed by macOS because the daemon does not set `pmset -b sleep 0`. When the app heartbeat is absent or stale, the daemon returns battery lid-close sleep to macOS with `pmset -b disablesleep 0` and remains resident for the next app launch.
 
 The menu bar app delegates power changes to the privileged controller. Its heartbeat contains enabled state and a reload generation. The controller reloads the active user's config when that generation changes, keeps its previous settings if parsing fails, and restarts the closed-lid delay when a reload occurs with the lid closed. Installation, repair, and update actions are conditional and run on a background thread; only those maintenance actions require administrator approval. Quit removes the heartbeat and writes a reset marker that the controller consumes.
+
+The menu bar process display is derived from one complete `/bin/ps -axo pid=,ppid=,command=` snapshot per refresh. It filters direct command-substring matches, then follows their available PPID chains without adding unrelated descendants. Shared parents are shown once, PID 0 and 1 terminate ancestry, and malformed cycles are broken deterministically. The tooltip, status line, and process submenu consume the same successful result; a scan failure clears the old display and reports that process status is unavailable. Inspection is read-only, and exited entries disappear on the next successful scan.
 
 The watchdog is intentionally narrower than the controller. It does not inspect lid state or timers, and it does not enable `SleepDisabled`; it only repairs toward normal battery lid-close sleep when the controller remains absent.
 

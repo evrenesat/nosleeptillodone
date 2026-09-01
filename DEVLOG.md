@@ -2,6 +2,7 @@
 
 | Date | Change |
 | --- | --- |
+| 2026-09-01 | Made process-aware menu waiting inspectable and fresh: one-second PID/PPID snapshots, direct-match counts, deduplicated parent trees, in-place submenu updates, and explicit unavailable status on scan failure. |
 | 2026-08-31 | Fixed Start at Login registration so enabling it does not launch a competing menu process that immediately exits on the single-instance lock. The toggle now affects future logins without restarting the current app. |
 | 2026-08-31 | Renamed the product to No Sleep Till Done, including binaries, bundle identifiers, launchd services, configuration paths, and documentation. Added compatibility migration for the previous LidSleep Delay config, login item, heartbeat, and privileged services. |
 | 2026-08-31 | Added persistent enable/disable and live configuration reload controls that do not restart the controller or require administrator approval. |

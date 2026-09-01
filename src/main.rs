@@ -561,7 +561,7 @@ fn clear_reset_request() -> Result<(), AppError> {
     }
 }
 
-fn log_process_matches(matches: &[no_sleep_till_done::system::ProcessMatch]) {
+fn log_process_matches(matches: &[no_sleep_till_done::system::ProcessInfo]) {
     for process in matches.iter().take(5) {
         log(&format!(
             "process match: pid={} {}",

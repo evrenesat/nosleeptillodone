@@ -114,7 +114,9 @@ command_substrings = [
 exit_grace_seconds = 300
 ```
 
-The controller matches these values case-sensitively against `/bin/ps -axo pid=,command=` output. When all matches disappear, it waits `exit_grace_seconds`, then sleeps if the lid is still closed.
+The controller matches these values case-sensitively against `/bin/ps -axo pid=,ppid=,command=` output. When all matches disappear, it waits `exit_grace_seconds`, then sleeps if the lid is still closed.
+
+After the lid-close delay expires, the menu bar app scans matching processes once per second while process waiting is relevant. Its tooltip and status line use the same successful scan as the `Waiting Processes (N)` submenu. `N` counts only direct command-substring matches. Each direct match is starred and shown with its PID and command; unstarred parent processes provide read-only ancestry context and do not increase `N`. The menu never controls these processes, and a failed scan is shown as unavailable instead of retaining an older count.
 
 For AI-agent guards, use the exact marker substring `nosleeptilldone`. The application binaries deliberately use the hyphenated name `no-sleep-till-done`, so this marker cannot match the app itself.
 

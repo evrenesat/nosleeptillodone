@@ -1,9 +1,12 @@
-use no_sleep_till_done::config::{load_or_create_config, set_enabled, AppConfig};
+use no_sleep_till_done::config::{
+    load_or_create_config, set_enabled, AppConfig, ProcessWaitConfig,
+};
 use no_sleep_till_done::system::{
-    matching_processes, read_battery_state, read_lid_state, read_sleep_disabled, BatteryState,
-    LidState, PowerSource,
+    filter_processes, process_table, read_battery_state, read_lid_state, read_sleep_disabled,
+    BatteryState, LidState, PowerSource, ProcessInfo, SystemError,
 };
 use no_sleep_till_done::{LeaseRecord, APP_ACTIVE_LEASE_PATH, CONTROLLER_RESET_REQUEST_PATH};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 #[cfg(unix)]
@@ -13,7 +16,9 @@ use std::process::{Command, ExitCode};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -39,6 +44,8 @@ const LEGACY_APP_ACTIVE_LEASE_PATH: &str = "/tmp/com.evren.lidsleep-delay.active
 const LEGACY_CONTROLLER_RESET_REQUEST_PATH: &str = "/tmp/com.evren.lidsleep-delay.reset";
 const HEARTBEAT_SECONDS: u64 = 5;
 const SERVICE_CHECK_SECONDS: u64 = 15;
+const PROCESS_WAIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const PROCESS_LABEL_MAX_CHARS: usize = 100;
 
 fn main() -> ExitCode {
     match run() {
@@ -269,6 +276,9 @@ struct MenuBarApp {
     lid_closed_since: Option<Instant>,
     saw_process_wait_matches: bool,
     process_grace_started: Option<Instant>,
+    process_display_state: ProcessDisplayState,
+    last_process_display_state: ProcessDisplayState,
+    process_submenu: Option<Submenu>,
     next_lease_refresh: Instant,
     next_service_check: Instant,
     next_refresh: Instant,
@@ -304,6 +314,9 @@ impl MenuBarApp {
             lid_closed_since: None,
             saw_process_wait_matches: false,
             process_grace_started: None,
+            process_display_state: ProcessDisplayState::Hidden,
+            last_process_display_state: ProcessDisplayState::Hidden,
+            process_submenu: None,
             next_lease_refresh: Instant::now() + Duration::from_secs(HEARTBEAT_SECONDS),
             next_service_check: Instant::now() + Duration::from_secs(SERVICE_CHECK_SECONDS),
             next_refresh: Instant::now(),
@@ -315,9 +328,8 @@ impl MenuBarApp {
             return Ok(());
         }
 
-        let menu = self.build_menu()?;
-
         let snapshot = self.snapshot();
+        let menu = self.build_menu()?;
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(render_icon(&snapshot, &self.config)?)
@@ -333,6 +345,14 @@ impl MenuBarApp {
 
     fn build_menu(&mut self) -> Result<Menu, Box<dyn std::error::Error>> {
         let status_item = MenuItem::new("Loading status", false, None);
+        let process_submenu = match &self.process_display_state {
+            ProcessDisplayState::Waiting(tree) => Some(build_process_submenu(tree)?),
+            ProcessDisplayState::Hidden | ProcessDisplayState::Unavailable => None,
+        };
+        let process_unavailable = matches!(
+            &self.process_display_state,
+            ProcessDisplayState::Unavailable
+        );
         let enabled_item = CheckMenuItem::with_id(
             self.enabled_id.clone(),
             "No Sleep Till Done Enabled",
@@ -373,6 +393,12 @@ impl MenuBarApp {
 
         let menu = Menu::new();
         menu.append(&status_item)?;
+        if let Some(item) = &process_submenu {
+            menu.append(item)?;
+        } else if process_unavailable {
+            let item = MenuItem::new("Waiting Processes: unavailable", false, None);
+            menu.append(&item)?;
+        }
         menu.append(&separator)?;
         menu.append(&enabled_item)?;
         menu.append(&reload_config)?;
@@ -388,6 +414,8 @@ impl MenuBarApp {
         self.enabled_item = Some(enabled_item);
         self.background_service_item = background_service_item;
         self.start_at_login_item = Some(start_at_login);
+        self.process_submenu = process_submenu;
+        self.last_process_display_state = self.process_display_state.clone();
         Ok(menu)
     }
 
@@ -396,6 +424,51 @@ impl MenuBarApp {
         if let Some(tray) = &self.tray {
             tray.set_menu(Some(Box::new(menu)));
         }
+        Ok(())
+    }
+
+    fn sync_process_menu(&mut self, rebuild_menu: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if rebuild_menu
+            || process_menu_variant(&self.last_process_display_state)
+                != process_menu_variant(&self.process_display_state)
+        {
+            self.rebuild_menu()?;
+            return Ok(());
+        }
+
+        let tree_changed = match (
+            &self.last_process_display_state,
+            &self.process_display_state,
+        ) {
+            (ProcessDisplayState::Waiting(previous), ProcessDisplayState::Waiting(current)) => {
+                process_tree_signature(previous) != process_tree_signature(current)
+            }
+            _ => false,
+        };
+
+        if tree_changed {
+            let tree = match &self.process_display_state {
+                ProcessDisplayState::Waiting(tree) => tree.clone(),
+                ProcessDisplayState::Hidden | ProcessDisplayState::Unavailable => unreachable!(),
+            };
+            self.update_process_submenu(&tree)?;
+        }
+
+        self.last_process_display_state = self.process_display_state.clone();
+        Ok(())
+    }
+
+    fn update_process_submenu(
+        &mut self,
+        tree: &ProcessTree,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(submenu) = self.process_submenu.as_ref().cloned() else {
+            return self.rebuild_menu();
+        };
+
+        submenu.set_text(waiting_processes_title(tree.match_count));
+        while submenu.remove_at(0).is_some() {}
+        append_process_tree_nodes(&submenu, &tree.roots)?;
         Ok(())
     }
 
@@ -446,13 +519,14 @@ impl MenuBarApp {
             self.next_service_check = Instant::now() + Duration::from_secs(SERVICE_CHECK_SECONDS);
         }
 
-        if rebuild_menu {
-            self.rebuild_menu()?;
-        }
-
         let snapshot = self.snapshot();
+        self.sync_process_menu(rebuild_menu)?;
         self.apply_snapshot(snapshot)?;
-        self.next_refresh = Instant::now() + Duration::from_secs(self.config.menu_refresh_seconds);
+        self.next_refresh = Instant::now()
+            + process_wait_refresh_interval(
+                self.process_wait_refresh_relevant(),
+                self.config.menu_refresh_seconds,
+            );
         Ok(())
     }
 
@@ -467,6 +541,7 @@ impl MenuBarApp {
                     self.lid_closed_since = None;
                     self.saw_process_wait_matches = false;
                     self.process_grace_started = None;
+                    self.process_display_state = ProcessDisplayState::Hidden;
                 }
                 None => {}
             }
@@ -531,40 +606,85 @@ impl MenuBarApp {
         {
             self.saw_process_wait_matches = false;
             self.process_grace_started = None;
+            self.process_display_state = ProcessDisplayState::Hidden;
             return None;
         }
 
         let closed_since = self.lid_closed_since?;
         let delay = Duration::from_secs(self.applied_config.delay_seconds);
         if closed_since.elapsed() < delay
-            || self
+            || !self
                 .applied_config
                 .process_wait
                 .command_substrings
-                .is_empty()
+                .iter()
+                .any(|value| !value.is_empty())
         {
+            self.process_display_state = ProcessDisplayState::Hidden;
             return None;
         }
 
-        let matches =
-            matching_processes(&self.applied_config.process_wait.command_substrings).ok()?;
-        if !matches.is_empty() {
-            self.saw_process_wait_matches = true;
-            self.process_grace_started = None;
-            return Some(ProcessWaitStatus::Waiting {
-                count: matches.len(),
+        let grace = Duration::from_secs(self.applied_config.process_wait.exit_grace_seconds);
+        if let Some(started) = self.process_grace_started {
+            if started.elapsed() < grace {
+                self.process_display_state = ProcessDisplayState::Hidden;
+                return Some(ProcessWaitStatus::Grace {
+                    remaining: grace.saturating_sub(started.elapsed()),
+                });
+            }
+        }
+
+        self.process_wait_status_from_scan(process_table(), now)
+    }
+
+    fn process_wait_status_from_scan(
+        &mut self,
+        scan: Result<Vec<ProcessInfo>, SystemError>,
+        now: Instant,
+    ) -> Option<ProcessWaitStatus> {
+        let table = match scan {
+            Ok(table) => table,
+            Err(_) => {
+                self.process_display_state = ProcessDisplayState::Unavailable;
+                return Some(ProcessWaitStatus::Unavailable);
+            }
+        };
+        let matches = filter_processes(
+            &table,
+            &self.applied_config.process_wait.command_substrings,
+            std::process::id(),
+        );
+
+        if matches.is_empty() {
+            self.process_display_state = ProcessDisplayState::Hidden;
+            if !self.saw_process_wait_matches {
+                return None;
+            }
+
+            let started = *self.process_grace_started.get_or_insert(now);
+            let grace = Duration::from_secs(self.applied_config.process_wait.exit_grace_seconds);
+            return Some(ProcessWaitStatus::Grace {
+                remaining: grace.saturating_sub(started.elapsed()),
             });
         }
 
-        if !self.saw_process_wait_matches {
-            return None;
-        }
+        let tree = build_process_tree(&table, &matches);
+        self.saw_process_wait_matches = true;
+        self.process_grace_started = None;
+        self.process_display_state = ProcessDisplayState::Waiting(tree.clone());
+        Some(ProcessWaitStatus::Waiting { tree })
+    }
 
-        let started = *self.process_grace_started.get_or_insert(now);
-        let grace = Duration::from_secs(self.applied_config.process_wait.exit_grace_seconds);
-        Some(ProcessWaitStatus::Grace {
-            remaining: grace.saturating_sub(started.elapsed()),
-        })
+    fn process_wait_refresh_relevant(&self) -> bool {
+        let delay_elapsed = self.lid_closed_since.is_some_and(|started| {
+            started.elapsed() >= Duration::from_secs(self.applied_config.delay_seconds)
+        });
+        process_wait_refresh_relevant(
+            self.enabled,
+            self.last_lid,
+            delay_elapsed,
+            &self.applied_config.process_wait,
+        )
     }
 
     fn handle_menu_event(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
@@ -659,6 +779,290 @@ impl MenuBarApp {
             let _ = tx.send(status);
         });
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProcessDisplayState {
+    Hidden,
+    Waiting(ProcessTree),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcessTree {
+    match_count: usize,
+    roots: Vec<ProcessTreeNode>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcessTreeNode {
+    process: ProcessInfo,
+    is_match: bool,
+    children: Vec<ProcessTreeNode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessMenuVariant {
+    Hidden,
+    Waiting,
+    Unavailable,
+}
+
+fn process_menu_variant(state: &ProcessDisplayState) -> ProcessMenuVariant {
+    match state {
+        ProcessDisplayState::Hidden => ProcessMenuVariant::Hidden,
+        ProcessDisplayState::Waiting(_) => ProcessMenuVariant::Waiting,
+        ProcessDisplayState::Unavailable => ProcessMenuVariant::Unavailable,
+    }
+}
+
+fn process_wait_refresh_relevant(
+    enabled: bool,
+    lid: Option<LidState>,
+    delay_elapsed: bool,
+    config: &ProcessWaitConfig,
+) -> bool {
+    enabled
+        && lid == Some(LidState::Closed)
+        && delay_elapsed
+        && config.enabled
+        && config
+            .command_substrings
+            .iter()
+            .any(|value| !value.is_empty())
+}
+
+fn process_wait_refresh_interval(
+    process_wait_relevant: bool,
+    menu_refresh_seconds: u64,
+) -> Duration {
+    if process_wait_relevant {
+        PROCESS_WAIT_REFRESH_INTERVAL
+    } else {
+        Duration::from_secs(menu_refresh_seconds.max(1))
+    }
+}
+
+fn build_process_tree(table: &[ProcessInfo], matches: &[ProcessInfo]) -> ProcessTree {
+    let processes: HashMap<u32, ProcessInfo> = table
+        .iter()
+        .cloned()
+        .map(|process| (process.pid, process))
+        .collect();
+    let matching_pids: BTreeSet<u32> = matches.iter().map(|process| process.pid).collect();
+    let mut relevant_pids = BTreeSet::new();
+
+    for matching in matches {
+        if !processes.contains_key(&matching.pid) {
+            continue;
+        }
+
+        let mut current_pid = matching.pid;
+        let mut path_pids = HashSet::new();
+        loop {
+            if !path_pids.insert(current_pid) || !relevant_pids.insert(current_pid) {
+                break;
+            }
+
+            let Some(process) = processes.get(&current_pid) else {
+                break;
+            };
+            if process.ppid <= 1 || !processes.contains_key(&process.ppid) {
+                break;
+            }
+            current_pid = process.ppid;
+        }
+    }
+
+    let mut parent_by_pid = HashMap::new();
+    for pid in relevant_pids.iter().copied() {
+        let parent = processes.get(&pid).and_then(|process| {
+            (process.ppid > 1 && relevant_pids.contains(&process.ppid)).then_some(process.ppid)
+        });
+        parent_by_pid.insert(pid, parent);
+    }
+    break_parent_cycles(&mut parent_by_pid);
+
+    let mut children_by_parent: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut roots = Vec::new();
+    for pid in relevant_pids.iter().copied() {
+        match parent_by_pid.get(&pid).copied().flatten() {
+            Some(parent) => children_by_parent.entry(parent).or_default().push(pid),
+            None => roots.push(pid),
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_unstable();
+    }
+
+    let roots = roots
+        .into_iter()
+        .map(|pid| {
+            build_process_tree_node(
+                pid,
+                &processes,
+                &matching_pids,
+                &children_by_parent,
+                &mut HashSet::new(),
+            )
+        })
+        .collect();
+
+    ProcessTree {
+        match_count: matches.len(),
+        roots,
+    }
+}
+
+fn break_parent_cycles(parent_by_pid: &mut HashMap<u32, Option<u32>>) {
+    let starts: Vec<u32> = {
+        let mut starts: Vec<_> = parent_by_pid.keys().copied().collect();
+        starts.sort_unstable();
+        starts
+    };
+
+    for start in starts {
+        let mut positions = HashMap::new();
+        let mut path = Vec::new();
+        let mut current = start;
+
+        loop {
+            if let Some(&cycle_start) = positions.get(&current) {
+                if let Some(break_pid) = path[cycle_start..].iter().copied().max() {
+                    parent_by_pid.insert(break_pid, None);
+                }
+                break;
+            }
+
+            positions.insert(current, path.len());
+            path.push(current);
+            let Some(parent) = parent_by_pid.get(&current).copied().flatten() else {
+                break;
+            };
+            current = parent;
+        }
+    }
+}
+
+fn build_process_tree_node(
+    pid: u32,
+    processes: &HashMap<u32, ProcessInfo>,
+    matching_pids: &BTreeSet<u32>,
+    children_by_parent: &BTreeMap<u32, Vec<u32>>,
+    path: &mut HashSet<u32>,
+) -> ProcessTreeNode {
+    let process = processes
+        .get(&pid)
+        .expect("process tree node must exist in the process table")
+        .clone();
+    if !path.insert(pid) {
+        return ProcessTreeNode {
+            process,
+            is_match: matching_pids.contains(&pid),
+            children: Vec::new(),
+        };
+    }
+
+    let child_ids = children_by_parent.get(&pid).cloned().unwrap_or_default();
+    let mut children = Vec::new();
+    for child in child_ids {
+        if !path.contains(&child) {
+            children.push(build_process_tree_node(
+                child,
+                processes,
+                matching_pids,
+                children_by_parent,
+                path,
+            ));
+        }
+    }
+    path.remove(&pid);
+
+    ProcessTreeNode {
+        process,
+        is_match: matching_pids.contains(&pid),
+        children,
+    }
+}
+
+type ProcessTreeSignature = Vec<(u32, u32, String, bool)>;
+
+fn process_tree_signature(tree: &ProcessTree) -> ProcessTreeSignature {
+    fn append_node_signature(node: &ProcessTreeNode, signature: &mut ProcessTreeSignature) {
+        signature.push((
+            node.process.pid,
+            node.process.ppid,
+            node.process.command.clone(),
+            node.is_match,
+        ));
+        for child in &node.children {
+            append_node_signature(child, signature);
+        }
+    }
+
+    let mut signature = Vec::new();
+    for root in &tree.roots {
+        append_node_signature(root, &mut signature);
+    }
+    signature
+}
+
+fn waiting_processes_title(count: usize) -> String {
+    format!("Waiting Processes ({count})")
+}
+
+fn waiting_processes_status(count: usize) -> String {
+    if count == 1 {
+        "waiting for 1 process".into()
+    } else {
+        format!("waiting for {count} processes")
+    }
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.into();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut result: String = value.chars().take(max_chars - 3).collect();
+    result.push_str("...");
+    result
+}
+
+fn process_menu_label(node: &ProcessTreeNode) -> String {
+    let prefix = if node.is_match { "* " } else { "" };
+    truncate_label(
+        &format!("{prefix}[{}] {}", node.process.pid, node.process.command),
+        PROCESS_LABEL_MAX_CHARS,
+    )
+}
+
+fn build_process_submenu(tree: &ProcessTree) -> Result<Submenu, Box<dyn std::error::Error>> {
+    let submenu = Submenu::new(waiting_processes_title(tree.match_count), true);
+    append_process_tree_nodes(&submenu, &tree.roots)?;
+    Ok(submenu)
+}
+
+fn append_process_tree_nodes(
+    parent: &Submenu,
+    nodes: &[ProcessTreeNode],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for node in nodes {
+        let label = process_menu_label(node);
+        if node.children.is_empty() {
+            let item = MenuItem::new(label, false, None);
+            parent.append(&item)?;
+        } else {
+            let submenu = Submenu::new(label, true);
+            append_process_tree_nodes(&submenu, &node.children)?;
+            parent.append(&submenu)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1031,9 +1435,12 @@ impl StatusSnapshot {
         } else {
             match self.lid {
                 Some(LidState::Open) => "lid open".into(),
-                Some(LidState::Closed) => match self.process_wait {
-                    Some(ProcessWaitStatus::Waiting { count }) => {
-                        format!("lid closed, waiting for {count} process(es)")
+                Some(LidState::Closed) => match &self.process_wait {
+                    Some(ProcessWaitStatus::Waiting { tree }) => {
+                        format!("lid closed, {}", waiting_processes_status(tree.match_count))
+                    }
+                    Some(ProcessWaitStatus::Unavailable) => {
+                        "lid closed, process status unavailable".into()
                     }
                     Some(ProcessWaitStatus::Grace { remaining }) => {
                         format!("lid closed, process grace {}s", remaining.as_secs())
@@ -1102,9 +1509,10 @@ enum MarkerMode {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ProcessWaitStatus {
-    Waiting { count: usize },
+    Waiting { tree: ProcessTree },
+    Unavailable,
     Grace { remaining: Duration },
 }
 
@@ -1408,8 +1816,52 @@ fn set_pixel(rgba: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 4]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{background_service_action_text, controller_config_changed, ServiceStatus};
-    use no_sleep_till_done::config::AppConfig;
+    use super::{
+        background_service_action_text, build_process_tree, controller_config_changed,
+        process_menu_label, process_tree_signature, process_wait_refresh_interval,
+        process_wait_refresh_relevant, waiting_processes_status, AppConfig, MenuBarApp,
+        ProcessDisplayState, ProcessInfo, ProcessTree, ProcessTreeNode, ProcessWaitStatus,
+        ServiceStatus, StatusSnapshot, SystemError, PROCESS_WAIT_REFRESH_INTERVAL,
+    };
+    use no_sleep_till_done::config::ProcessWaitConfig;
+    use no_sleep_till_done::system::LidState;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn process(pid: u32, ppid: u32, command: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid,
+            command: command.into(),
+        }
+    }
+
+    fn pids(nodes: &[ProcessTreeNode]) -> Vec<u32> {
+        nodes.iter().map(|node| node.process.pid).collect()
+    }
+
+    fn process_wait_config(command_substrings: &[&str]) -> ProcessWaitConfig {
+        ProcessWaitConfig {
+            enabled: true,
+            command_substrings: command_substrings
+                .iter()
+                .map(|value| (*value).into())
+                .collect(),
+            exit_grace_seconds: 300,
+        }
+    }
+
+    fn test_app() -> MenuBarApp {
+        let config = AppConfig {
+            process_wait: process_wait_config(&["agent"]),
+            ..AppConfig::default()
+        };
+        MenuBarApp::new(
+            config,
+            PathBuf::from("/tmp/no-sleep-till-done-test.toml"),
+            1,
+        )
+    }
 
     #[test]
     fn healthy_service_has_no_maintenance_action() {
@@ -1430,5 +1882,178 @@ mod tests {
 
         current.delay_seconds = 30;
         assert!(controller_config_changed(&current, &applied));
+    }
+
+    #[test]
+    fn process_tree_deduplicates_shared_ancestors_and_sorts_nodes() {
+        let table = vec![
+            process(40, 20, "worker-b"),
+            process(10, 1, "shell"),
+            process(30, 20, "worker-a"),
+            process(20, 10, "runner"),
+        ];
+        let matches = vec![table[0].clone(), table[2].clone()];
+
+        let tree = build_process_tree(&table, &matches);
+
+        assert_eq!(tree.match_count, 2);
+        assert_eq!(pids(&tree.roots), vec![10]);
+        assert!(!tree.roots[0].is_match);
+        assert_eq!(pids(&tree.roots[0].children), vec![20]);
+        assert_eq!(pids(&tree.roots[0].children[0].children), vec![30, 40]);
+        assert!(tree.roots[0].children[0]
+            .children
+            .iter()
+            .all(|node| node.is_match));
+    }
+
+    #[test]
+    fn process_tree_uses_highest_available_roots_and_omits_unrelated_descendants() {
+        let table = vec![
+            process(60, 1, "direct-b"),
+            process(30, 20, "direct-a"),
+            process(20, 10, "ancestor"),
+            process(10, 1, "root"),
+            process(40, 20, "unrelated-child"),
+            process(50, 30, "unrelated-grandchild"),
+        ];
+        let matches = vec![table[0].clone(), table[1].clone()];
+
+        let tree = build_process_tree(&table, &matches);
+
+        assert_eq!(pids(&tree.roots), vec![10, 60]);
+        assert_eq!(pids(&tree.roots[0].children), vec![20]);
+        assert_eq!(pids(&tree.roots[0].children[0].children), vec![30]);
+        assert!(!process_tree_signature(&tree)
+            .iter()
+            .any(|(pid, _, _, _)| *pid == 40 || *pid == 50));
+    }
+
+    #[test]
+    fn process_tree_breaks_parent_cycles_without_recursing_forever() {
+        let table = vec![process(20, 30, "direct"), process(30, 20, "cycle")];
+        let tree = build_process_tree(&table, &[table[0].clone()]);
+
+        assert_eq!(pids(&tree.roots), vec![30]);
+        assert_eq!(pids(&tree.roots[0].children), vec![20]);
+        assert!(tree.roots[0].children[0].children.is_empty());
+        assert!(tree.roots[0].children[0].is_match);
+    }
+
+    #[test]
+    fn process_menu_labels_mark_matches_and_truncate_unicode_safely() {
+        let node = ProcessTreeNode {
+            process: process(123, 1, &"é".repeat(120)),
+            is_match: true,
+            children: Vec::new(),
+        };
+
+        let label = process_menu_label(&node);
+
+        assert_eq!(label.chars().count(), 100);
+        assert!(label.starts_with("* [123] "));
+        assert!(label.ends_with("..."));
+    }
+
+    #[test]
+    fn process_wait_refresh_is_one_second_only_in_relevant_closed_lid_state() {
+        let config = process_wait_config(&["agent"]);
+        assert!(!process_wait_refresh_relevant(
+            false,
+            Some(LidState::Closed),
+            true,
+            &config
+        ));
+        assert!(!process_wait_refresh_relevant(
+            true,
+            Some(LidState::Open),
+            true,
+            &config
+        ));
+        assert!(!process_wait_refresh_relevant(
+            true,
+            Some(LidState::Closed),
+            false,
+            &config
+        ));
+        assert!(process_wait_refresh_relevant(
+            true,
+            Some(LidState::Closed),
+            true,
+            &config
+        ));
+        assert_eq!(
+            process_wait_refresh_interval(true, 9),
+            PROCESS_WAIT_REFRESH_INTERVAL
+        );
+        assert_eq!(
+            process_wait_refresh_interval(false, 9),
+            Duration::from_secs(9)
+        );
+    }
+
+    #[test]
+    fn waiting_status_uses_singular_and_plural_wording() {
+        assert_eq!(waiting_processes_status(1), "waiting for 1 process");
+        assert_eq!(waiting_processes_status(2), "waiting for 2 processes");
+    }
+
+    #[test]
+    fn failed_process_scan_is_unavailable_and_does_not_start_grace() {
+        let mut app = test_app();
+        let now = Instant::now();
+        let result = app.process_wait_status_from_scan(
+            Err(SystemError::CommandFailed("ps failed".into())),
+            now,
+        );
+
+        assert_eq!(result, Some(ProcessWaitStatus::Unavailable));
+        assert_eq!(app.process_display_state, ProcessDisplayState::Unavailable);
+        assert!(!app.saw_process_wait_matches);
+        assert!(app.process_grace_started.is_none());
+    }
+
+    #[test]
+    fn failed_process_scan_clears_old_display_but_preserves_existing_grace() {
+        let mut app = test_app();
+        let started = Instant::now() - Duration::from_secs(10);
+        app.saw_process_wait_matches = true;
+        app.process_grace_started = Some(started);
+        app.process_display_state = ProcessDisplayState::Waiting(ProcessTree {
+            match_count: 1,
+            roots: vec![ProcessTreeNode {
+                process: process(123, 1, "agent"),
+                is_match: true,
+                children: Vec::new(),
+            }],
+        });
+
+        let result = app.process_wait_status_from_scan(
+            Err(SystemError::CommandFailed("ps failed".into())),
+            Instant::now(),
+        );
+
+        assert_eq!(result, Some(ProcessWaitStatus::Unavailable));
+        assert_eq!(app.process_display_state, ProcessDisplayState::Unavailable);
+        assert_eq!(app.process_grace_started, Some(started));
+    }
+
+    #[test]
+    fn unavailable_status_does_not_fall_back_to_a_stale_count() {
+        let snapshot = StatusSnapshot {
+            battery: None,
+            lid: Some(LidState::Closed),
+            sleep_disabled: Some(true),
+            remaining: None,
+            process_wait: Some(ProcessWaitStatus::Unavailable),
+            enabled: true,
+            service_status: ServiceStatus::Ready,
+            config_notice: None,
+        };
+
+        let status = snapshot.menu_status_text(&AppConfig::default());
+
+        assert!(status.contains("process status unavailable"));
+        assert!(!status.contains("waiting for"));
     }
 }

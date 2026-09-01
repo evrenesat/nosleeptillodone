@@ -62,8 +62,9 @@ pub struct BatteryState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessMatch {
+pub struct ProcessInfo {
     pub pid: u32,
+    pub ppid: u32,
     pub command: String,
 }
 
@@ -154,19 +155,9 @@ pub fn read_battery_state() -> Result<BatteryState, SystemError> {
     })
 }
 
-pub fn matching_processes(command_substrings: &[String]) -> Result<Vec<ProcessMatch>, SystemError> {
-    let needles: Vec<&str> = command_substrings
-        .iter()
-        .map(|value| value.as_str())
-        .filter(|value| !value.is_empty())
-        .collect();
-
-    if needles.is_empty() {
-        return Ok(Vec::new());
-    }
-
+pub fn process_table() -> Result<Vec<ProcessInfo>, SystemError> {
     let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,command="])
+        .args(["-axo", "pid=,ppid=,command="])
         .output()?;
     if !output.status.success() {
         return Err(SystemError::CommandFailed(
@@ -174,32 +165,71 @@ pub fn matching_processes(command_substrings: &[String]) -> Result<Vec<ProcessMa
         ));
     }
 
-    let current_pid = std::process::id();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let matches = stdout
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(parse_ps_line)
-        .filter(|process| process.pid != current_pid)
+        .collect())
+}
+
+pub fn matching_processes(command_substrings: &[String]) -> Result<Vec<ProcessInfo>, SystemError> {
+    if command_substrings.iter().all(String::is_empty) {
+        return Ok(Vec::new());
+    }
+
+    let table = process_table()?;
+    Ok(filter_processes(
+        &table,
+        command_substrings,
+        std::process::id(),
+    ))
+}
+
+pub fn filter_processes(
+    table: &[ProcessInfo],
+    command_substrings: &[String],
+    excluded_pid: u32,
+) -> Vec<ProcessInfo> {
+    let needles: Vec<&str> = command_substrings
+        .iter()
+        .map(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    if needles.is_empty() {
+        return Vec::new();
+    }
+
+    table
+        .iter()
+        .filter(|process| process.pid != excluded_pid)
         .filter(|process| {
             needles
                 .iter()
                 .any(|needle| process.command.contains(needle))
         })
-        .collect();
-
-    Ok(matches)
+        .cloned()
+        .collect()
 }
 
-fn parse_ps_line(line: &str) -> Option<ProcessMatch> {
+fn parse_ps_line(line: &str) -> Option<ProcessInfo> {
     let line = line.trim_start();
-    let split_at = line.find(char::is_whitespace)?;
-    let pid = line[..split_at].parse::<u32>().ok()?;
-    let command = line[split_at..].trim_start().to_string();
+    let pid_end = line.find(char::is_whitespace)?;
+    let pid = line[..pid_end].parse::<u32>().ok()?;
+
+    let ppid_field = line[pid_end..].trim_start();
+    let ppid_end = ppid_field.find(char::is_whitespace)?;
+    let ppid = ppid_field[..ppid_end].parse::<u32>().ok()?;
+
+    let command = ppid_field[ppid_end..].trim_start();
     if command.is_empty() {
         return None;
     }
 
-    Some(ProcessMatch { pid, command })
+    Some(ProcessInfo {
+        pid,
+        ppid,
+        command: command.to_string(),
+    })
 }
 
 fn read_root_domain_bool(property: &str) -> Result<bool, SystemError> {
@@ -242,5 +272,59 @@ fn read_root_domain_bool(property: &str) -> Result<bool, SystemError> {
         let result = CFBooleanGetValue(value) != 0;
         CFRelease(value);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_processes, parse_ps_line, ProcessInfo};
+
+    fn process(pid: u32, ppid: u32, command: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid,
+            command: command.into(),
+        }
+    }
+
+    #[test]
+    fn parses_pid_ppid_and_command_with_leading_whitespace() {
+        assert_eq!(
+            parse_ps_line("   123   45 /usr/bin/python script with spaces"),
+            Some(process(123, 45, "/usr/bin/python script with spaces"))
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_process_rows() {
+        for line in [
+            "",
+            "123",
+            "123 45",
+            "not-a-pid 45 command",
+            "123 not-a-ppid command",
+            "123 45   ",
+        ] {
+            assert_eq!(
+                parse_ps_line(line),
+                None,
+                "row should be rejected: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filters_case_sensitive_substrings_and_excludes_the_requested_pid() {
+        let table = vec![
+            process(10, 1, "/usr/bin/codex agent"),
+            process(11, 1, "/usr/bin/Codex agent"),
+            process(12, 1, "/usr/bin/python worker"),
+        ];
+
+        assert_eq!(
+            filter_processes(&table, &["".into(), "agent".into()], 10),
+            vec![process(11, 1, "/usr/bin/Codex agent")]
+        );
+        assert!(filter_processes(&table, &["".into()], 0).is_empty());
     }
 }
