@@ -522,9 +522,12 @@ impl MenuBarApp {
         let snapshot = self.snapshot();
         self.sync_process_menu(rebuild_menu)?;
         self.apply_snapshot(snapshot)?;
-        self.next_refresh = Instant::now()
+        let next_refresh_started = Instant::now();
+        let delay_remaining = self.process_wait_delay_remaining(next_refresh_started);
+        self.next_refresh = next_refresh_started
             + process_wait_refresh_interval(
-                self.process_wait_refresh_relevant(),
+                self.process_wait_refresh_relevant(delay_remaining),
+                delay_remaining,
                 self.config.menu_refresh_seconds,
             );
         Ok(())
@@ -600,6 +603,15 @@ impl MenuBarApp {
         lid: Option<LidState>,
         now: Instant,
     ) -> Option<ProcessWaitStatus> {
+        self.process_wait_status_with_scan(lid, now, process_table)
+    }
+
+    fn process_wait_status_with_scan(
+        &mut self,
+        lid: Option<LidState>,
+        now: Instant,
+        scan: impl FnOnce() -> Result<Vec<ProcessInfo>, SystemError>,
+    ) -> Option<ProcessWaitStatus> {
         if !self.enabled
             || lid != Some(LidState::Closed)
             || !self.applied_config.process_wait.enabled
@@ -624,17 +636,7 @@ impl MenuBarApp {
             return None;
         }
 
-        let grace = Duration::from_secs(self.applied_config.process_wait.exit_grace_seconds);
-        if let Some(started) = self.process_grace_started {
-            if started.elapsed() < grace {
-                self.process_display_state = ProcessDisplayState::Hidden;
-                return Some(ProcessWaitStatus::Grace {
-                    remaining: grace.saturating_sub(started.elapsed()),
-                });
-            }
-        }
-
-        self.process_wait_status_from_scan(process_table(), now)
+        self.process_wait_status_from_scan(scan(), now)
     }
 
     fn process_wait_status_from_scan(
@@ -675,14 +677,30 @@ impl MenuBarApp {
         Some(ProcessWaitStatus::Waiting { tree })
     }
 
-    fn process_wait_refresh_relevant(&self) -> bool {
-        let delay_elapsed = self.lid_closed_since.is_some_and(|started| {
-            started.elapsed() >= Duration::from_secs(self.applied_config.delay_seconds)
-        });
+    fn process_wait_delay_remaining(&self, now: Instant) -> Option<Duration> {
+        if !self.enabled
+            || self.last_lid != Some(LidState::Closed)
+            || !self.applied_config.process_wait.enabled
+            || !self
+                .applied_config
+                .process_wait
+                .command_substrings
+                .iter()
+                .any(|value| !value.is_empty())
+        {
+            return None;
+        }
+
+        let closed_since = self.lid_closed_since?;
+        let elapsed = now.saturating_duration_since(closed_since);
+        Some(Duration::from_secs(self.applied_config.delay_seconds).saturating_sub(elapsed))
+    }
+
+    fn process_wait_refresh_relevant(&self, delay_remaining: Option<Duration>) -> bool {
         process_wait_refresh_relevant(
             self.enabled,
             self.last_lid,
-            delay_elapsed,
+            delay_remaining.is_some_and(|remaining| remaining.is_zero()),
             &self.applied_config.process_wait,
         )
     }
@@ -834,12 +852,16 @@ fn process_wait_refresh_relevant(
 
 fn process_wait_refresh_interval(
     process_wait_relevant: bool,
+    delay_remaining: Option<Duration>,
     menu_refresh_seconds: u64,
 ) -> Duration {
+    let configured_interval = Duration::from_secs(menu_refresh_seconds.max(1));
     if process_wait_relevant {
         PROCESS_WAIT_REFRESH_INTERVAL
+    } else if let Some(remaining) = delay_remaining {
+        remaining.min(configured_interval)
     } else {
-        Duration::from_secs(menu_refresh_seconds.max(1))
+        configured_interval
     }
 }
 
@@ -1983,12 +2005,20 @@ mod tests {
             &config
         ));
         assert_eq!(
-            process_wait_refresh_interval(true, 9),
+            process_wait_refresh_interval(true, Some(Duration::ZERO), 9),
             PROCESS_WAIT_REFRESH_INTERVAL
         );
         assert_eq!(
-            process_wait_refresh_interval(false, 9),
+            process_wait_refresh_interval(false, None, 9),
             Duration::from_secs(9)
+        );
+        assert_eq!(
+            process_wait_refresh_interval(false, Some(Duration::from_millis(250)), 5),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            process_wait_refresh_interval(false, Some(Duration::from_secs(9)), 5),
+            Duration::from_secs(5)
         );
     }
 
@@ -2036,6 +2066,32 @@ mod tests {
         assert_eq!(result, Some(ProcessWaitStatus::Unavailable));
         assert_eq!(app.process_display_state, ProcessDisplayState::Unavailable);
         assert_eq!(app.process_grace_started, Some(started));
+    }
+
+    #[test]
+    fn matching_process_reappearing_during_grace_restores_waiting_tree() {
+        let mut app = test_app();
+        app.last_lid = Some(LidState::Closed);
+        app.lid_closed_since =
+            Some(Instant::now() - Duration::from_secs(app.applied_config.delay_seconds + 1));
+        app.saw_process_wait_matches = true;
+        app.process_grace_started = Some(Instant::now() - Duration::from_secs(1));
+
+        let result =
+            app.process_wait_status_with_scan(Some(LidState::Closed), Instant::now(), || {
+                Ok(vec![process(4242, 1, "agent --reappeared")])
+            });
+
+        let Some(ProcessWaitStatus::Waiting { tree }) = result else {
+            panic!("a matching process during grace should restore waiting");
+        };
+        assert_eq!(tree.match_count, 1);
+        assert_eq!(pids(&tree.roots), vec![4242]);
+        assert_eq!(
+            app.process_display_state,
+            ProcessDisplayState::Waiting(tree)
+        );
+        assert!(app.process_grace_started.is_none());
     }
 
     #[test]
